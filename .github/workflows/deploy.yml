@@ -1,0 +1,104 @@
+name: Deploy FastAPI to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Create deployment environment file from GitHub Secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          if [ -z "$AWS_DEFAULT_REGION" ]; then
+            AWS_DEFAULT_REGION="ap-southeast-1"
+          fi
+
+          : > deploy.env
+          printf '%s\n' "APP_NAME=Cloud FastAPI Deployment" >> deploy.env
+          printf '%s\n' "APP_VERSION=1.0.0" >> deploy.env
+          printf '%s\n' "ENVIRONMENT=production" >> deploy.env
+          printf '%s\n' "DEBUG=false" >> deploy.env
+          printf '%s\n' "ALLOWED_ORIGINS=*" >> deploy.env
+          printf '%s\n' "DATABASE_URL=$DATABASE_URL" >> deploy.env
+          printf '%s\n' "S3_BUCKET_NAME=$S3_BUCKET_NAME" >> deploy.env
+          printf '%s\n' "AWS_REGION=$AWS_DEFAULT_REGION" >> deploy.env
+          printf '%s\n' "AWS_DEFAULT_REGION=$AWS_DEFAULT_REGION" >> deploy.env
+          printf '%s\n' "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" >> deploy.env
+          printf '%s\n' "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" >> deploy.env
+          printf '%s\n' "S3_UPLOAD_PREFIX=uploads" >> deploy.env
+          printf '%s\n' "PRESIGNED_URL_EXPIRATION_SECONDS=3600" >> deploy.env
+
+      - name: Copy deployment environment file to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          if [ -z "$EC2_USER" ]; then
+            EC2_USER="ubuntu"
+          fi
+          scp -i ~/.ssh/ec2_key deploy.env "$EC2_USER@$EC2_HOST:/tmp/cloud-fastapi.env"
+
+      - name: Deploy on EC2 by pulling code and rebuilding Docker image
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          BRANCH_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -z "$EC2_USER" ]; then
+            EC2_USER="ubuntu"
+          fi
+
+          ssh -i ~/.ssh/ec2_key "$EC2_USER@$EC2_HOST" \
+            "REPO_URL='$REPO_URL' BRANCH_NAME='$BRANCH_NAME' bash -s" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          APP_DIR="$HOME/cloud-fastapi-deployment"
+          CONTAINER_NAME="fastapi-app"
+          IMAGE_NAME="fastapi-app:latest"
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            echo "Repository not found on EC2. Cloning $REPO_URL into $APP_DIR"
+            git clone "$REPO_URL" "$APP_DIR"
+          fi
+
+          cd "$APP_DIR"
+          git fetch origin "$BRANCH_NAME"
+          git reset --hard "origin/$BRANCH_NAME"
+
+          mv /tmp/cloud-fastapi.env .env
+          chmod 600 .env
+
+          docker stop "$CONTAINER_NAME" || true
+          docker rm "$CONTAINER_NAME" || true
+          docker build -t "$IMAGE_NAME" .
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            --env-file .env \
+            -p 8000:8000 \
+            "$IMAGE_NAME"
+
+          docker ps --filter "name=$CONTAINER_NAME"
+          curl -f http://localhost:8000/health
+          REMOTE_SCRIPT
