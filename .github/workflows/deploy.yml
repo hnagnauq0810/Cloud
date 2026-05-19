@@ -100,5 +100,19 @@ jobs:
             "$IMAGE_NAME"
 
           docker ps --filter "name=$CONTAINER_NAME"
-          curl -f http://localhost:8000/health
+
+          for attempt in $(seq 1 12); do
+            if curl -fsS http://localhost:8000/health; then
+              echo
+              echo "Health check passed on attempt $attempt."
+              exit 0
+            fi
+
+            echo "Health check attempt $attempt failed. Waiting for app startup..."
+            sleep 5
+          done
+
+          echo "Container did not become healthy in time. Recent logs:"
+          docker logs "$CONTAINER_NAME" --tail 100
+          exit 1
           REMOTE_SCRIPT
